@@ -1,0 +1,1043 @@
+package net.codejava.controller;
+
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.sql.Statement;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.Collectors;
+import javax.annotation.PreDestroy;
+import net.codejava.constants.AltayWarrantStatusType;
+import net.codejava.enums.LimsType;
+import net.codejava.model.CellOperationModel;
+import net.codejava.model.WarrantEntryModel;
+import net.codejava.model.WarrantOperationModel;
+import net.codejava.model.WarrantReturnModel;
+import net.codejava.model.first.CellOperationEntity;
+import net.codejava.service.CellOperationService;
+import net.codejava.service.factory.LimsServices;
+import net.codejava.service.factory.LimsServicesFactory;
+import net.codejava.service.factory.NeGroupStrategyFactory;
+import net.codejava.service.turktelekom.TurkTelekomArgelaNeGroupService;
+import net.codejava.utils.LimsProperties;
+import net.codejava.utils.Utils;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.format.annotation.DateTimeFormat;
+import org.springframework.http.ResponseEntity;
+import org.springframework.scheduling.annotation.Scheduled;
+import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.servlet.ModelAndView;
+
+@RestController
+@RequestMapping("/cellOperation")
+public class CellVizyonOperationController {
+
+    private static final Logger logger = LoggerFactory.getLogger(CellVizyonOperationController.class);
+
+    private final Map<String, ProcessData> processDataMap = new ConcurrentHashMap<>();
+
+    private final ExecutorService executorService = Executors.newCachedThreadPool();
+
+    WarrantEntryModel   warrantEntryModelGsmAveaNokia,
+                        warrantEntryModelGsmAveaArgelaCs,
+                        warrantEntryModelGsmAveaArgelaVolte;
+
+    @Autowired
+    private TurkTelekomArgelaNeGroupService ttVolteService;
+    
+    @Autowired
+    private LimsServicesFactory limsServicesFactory;
+
+    @Autowired
+    private LimsProperties limsProperties;
+
+    @Autowired
+    private CellOperationService service;
+
+    Locale trlocale = new Locale("tr-TR");
+
+    // 1 saatte bir eski iÅlemleri temizle
+    @Scheduled(fixedRate = 3600000)
+    public void cleanupOldProcesses() {
+        long now = System.currentTimeMillis();
+        processDataMap.entrySet().removeIf(entry
+                -> (entry.getValue().progress >= 100 || now - entry.getValue().lastAccessTime > 3600000) // 1 saat
+        );
+    }
+
+    @PreDestroy
+    public void cleanup() {
+        executorService.shutdown();
+        try {
+            if (!executorService.awaitTermination(60, TimeUnit.SECONDS)) {
+                executorService.shutdownNow();
+            }
+        } catch (InterruptedException e) {
+            executorService.shutdownNow();
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    private static class ProcessData {
+
+        private volatile double progress = 0;
+        private final StringBuilder logs = new StringBuilder();
+        private volatile int lastSentLogLength = 0;
+        private volatile long lastAccessTime = System.currentTimeMillis();
+
+        public synchronized void addLog(String log) {
+            logs.append(log);
+            lastAccessTime = System.currentTimeMillis();
+        }
+    }
+
+    @GetMapping("/startProcess")
+    public ResponseEntity<String> startProcess(@RequestParam String processId) {
+        processDataMap.put(processId, new ProcessData());
+        return ResponseEntity.ok("Process started with ID: " + processId);
+    }
+
+    @Scheduled(fixedRate = 300000)
+    public void processPendingOperations() {
+        List<String> pendingProcessIds = service.findDistinctProcessIdsByStatus("PENDING");
+        pendingProcessIds.forEach(processId -> {
+            logger.info("Restarting Pending Process: {}", processId);
+            startProcessing(processId);
+        });
+    }
+
+    @GetMapping("/logs")
+    public synchronized ResponseEntity<String> getLogs(
+            @RequestParam String processId,
+            @RequestParam int lastLength) {
+        ProcessData data = processDataMap.get(processId);
+        if (data == null) {
+            return ResponseEntity.ok("");
+        }
+
+        // DB'den sonuÃ§larÄ± da getir
+        List<CellOperationEntity> results = service.findByProcessId(processId);
+        StringBuilder logs = new StringBuilder();
+        results.forEach(r -> logs.append(r.getResult()).append("\n"));
+
+        String newLogs = logs.substring(Math.min(lastLength, logs.length()));
+        data.lastSentLogLength = logs.length();
+        return ResponseEntity.ok(newLogs);
+    }
+
+    @GetMapping("/progress")
+    public ResponseEntity<Double> getProgress(@RequestParam String processId) {
+        long total = service.countByProcessId(processId);
+        long completed = service.countByProcessIdAndStatus(processId, "COMPLETED");
+
+        if (total == 0) {
+            return ResponseEntity.ok(0.0);
+        }
+
+        double progress = (completed * 100.0) / total;
+        return ResponseEntity.ok(progress);
+    }
+
+    @GetMapping("/getOperatorDetails")
+    public ResponseEntity<Map<String, Object>> getOperatorDetails(@RequestParam String operator) {
+        Map<String, Object> response = new HashMap<>();
+
+        String[] limsName = {
+            "GSM-AVEA-NOKIA-TIB",
+            "GSM-AVEA-ARGELA-CS",
+            "GSM-AVEA-ARGELA-VOLTE",
+            "TT-ARGELA-HUAWEI",
+            "TT-ARGELA-ZTE",
+            "GSM-TURKCELL-ERICSSON-IMS1",
+            "GSM-TURKCELL-MAVENIR-DIGILIMS",
+            "SUPERONLINE-MAVENIR-DIGILIMS-VOLTE",
+            "VODAFONE-NOKIA-VOIDA-CS",
+            "VODAFONE-NOKIA-VOIDA-VOLTE",
+            "STH-DIGILIMS"};
+        ArrayList<String> limsType = new ArrayList<>();
+        for (String item : limsName) {
+            if (operator.equals("TT MOBIL")) {
+                if (item.contains("AVEA")) {
+                    limsType.add(item);
+                }
+            } else if (operator.equals("TT SABIT")) {
+                if (item.contains("TT")) {
+                    limsType.add(item);
+                }
+            } else if (item.contains(operator)) {
+                limsType.add(item);
+            }
+        }
+
+        response.put("lims", limsType);
+        return ResponseEntity.ok(response);
+    }
+
+    private void updateProgress(ProcessData data, int processed, int total) {
+        synchronized (data) {
+            data.progress = (processed * 100.0) / total;
+            data.lastAccessTime = System.currentTimeMillis();
+        }
+    }
+
+    @GetMapping("/history")
+    public ModelAndView getProcessHistory(
+            @RequestParam(required = false) @DateTimeFormat(pattern = "yyyy-MM-dd") Date startDate,
+            @RequestParam(required = false) @DateTimeFormat(pattern = "yyyy-MM-dd") Date endDate) {
+
+        ModelAndView mav = new ModelAndView("processHistory");
+
+        List<ProcessHistoryDTO> historyList;
+        if (startDate != null && endDate != null) {
+            // Tarih aralÄ±ÄÄ±na gÃ¶re filtrele
+            List<CellOperationEntity> entities = service.findByProcessedAtBetween(startDate, endDate);
+            historyList = createHistoryDTOs(entities);
+        } else {
+            // TÃ¼m iÅlemleri getir
+            List<String> processIds = service.getDistinctProcessIds();
+            historyList = processIds.stream()
+                    .map(this::createHistoryDTO)
+                    .collect(Collectors.toList());
+        }
+
+        mav.addObject("historyList", historyList);
+        return mav;
+    }
+
+    @GetMapping("/history/{processId}")
+    public ModelAndView getProcessDetails(@PathVariable String processId) {
+        ModelAndView mav = new ModelAndView("processDetails");
+
+        List<CellOperationEntity> details = service.findByProcessId(processId);
+        long total = details.size();
+        long success = details.stream().filter(d -> "COMPLETED".equals(d.getStatus())).count();
+        long failed = details.stream().filter(d -> "FAILED".equals(d.getStatus())).count();
+        long pending = details.stream().filter(d -> "PENDING".equals(d.getStatus())).count();
+
+        mav.addObject("processId", processId);
+        mav.addObject("details", details);
+        mav.addObject("stats", Map.of(
+                "total", total,
+                "success", success,
+                "failed", failed,
+                "pending", pending,
+                "progress", (int) ((success * 100) / total)
+        ));
+
+        return mav;
+    }
+
+    @GetMapping("/retry/{processId}")
+    public ResponseEntity<?> retryFailedOperations(@PathVariable String processId) {
+        List<CellOperationEntity> failedItems = service.findByProcessIdAndStatus(processId, "FAILED");
+
+        if (failedItems.isEmpty()) {
+            return ResponseEntity.ok("Yeniden iÅlenecek baÅarÄ±sÄ±z kayÄ±t bulunamadÄ±");
+        }
+
+        List<Long> ids = failedItems.stream().map(CellOperationEntity::getId).collect(Collectors.toList());
+        service.resetStatusForRetry(ids);
+
+        // Yeniden iÅlemi baÅlat
+        startProcessing(processId);
+
+        return ResponseEntity.ok(failedItems.size() + " adet baÅarÄ±sÄ±z kayÄ±t yeniden iÅlenmek Ã¼zere sÄ±raya alÄ±ndÄ±");
+    }
+
+    @GetMapping("/export/{processId}")
+    public ResponseEntity<byte[]> exportProcessReport(@PathVariable String processId) {
+        List<CellOperationEntity> details = service.findByProcessId(processId);
+
+        // CSV oluÅtur
+        String csvContent = "ID,Hedef No,Operator,LIMS,Status,Result,Processed At\n";
+        for (CellOperationEntity item : details) {
+            csvContent += String.join(",",
+                    item.getId().toString(),
+                    item.getHedefno(),
+                    item.getOperator(),
+                    item.getLims(),
+                    item.getStatus(),
+                    item.getResult() != null ? item.getResult().replace(",", ";") : "",
+                    item.getProcessedAt() != null ? item.getProcessedAt().toString() : ""
+            ) + "\n";
+        }
+
+        byte[] csvBytes = csvContent.getBytes();
+
+        return ResponseEntity.ok()
+                .header("Content-Type", "text/csv")
+                .header("Content-Disposition", "attachment; filename=\"process_report_" + processId + ".csv\"")
+                .body(csvBytes);
+    }
+
+    private ProcessHistoryDTO createHistoryDTO(String processId) {
+        List<CellOperationEntity> items = service.findByProcessId(processId);
+        long total = items.size();
+        long success = items.stream().filter(i -> "COMPLETED".equals(i.getStatus())).count();
+
+        return new ProcessHistoryDTO(
+                processId,
+                items.get(0).getCreatedAt(),
+                items.get(0).getOperator(),
+                items.get(0).getLims(),
+                total,
+                success,
+                (int) ((success * 100) / total)
+        );
+    }
+
+    private List<ProcessHistoryDTO> createHistoryDTOs(List<CellOperationEntity> entities) {
+        Map<String, List<CellOperationEntity>> grouped = entities.stream()
+                .collect(Collectors.groupingBy(CellOperationEntity::getProcessId));
+
+        return grouped.entrySet().stream()
+                .map(entry -> {
+                    List<CellOperationEntity> items = entry.getValue();
+                    long total = items.size();
+                    long success = items.stream().filter(i -> "COMPLETED".equals(i.getStatus())).count();
+
+                    return new ProcessHistoryDTO(
+                            entry.getKey(),
+                            items.get(0).getCreatedAt(),
+                            items.get(0).getOperator(),
+                            items.get(0).getLims(),
+                            total,
+                            success,
+                            (int) ((success * 100) / total)
+                    );
+                })
+                .sorted(Comparator.comparing(ProcessHistoryDTO::getCreatedAt).reversed())
+                .collect(Collectors.toList());
+    }
+
+    // DTO sÄ±nÄ±fÄ±
+    private static class ProcessHistoryDTO {
+
+        public ProcessHistoryDTO(String processId, LocalDateTime createdAt, String operator, String lims, long totalItems, long successItems, int successRate) {
+            this.processId = processId;
+            this.createdAt = createdAt;
+            this.operator = operator;
+            this.lims = lims;
+            this.totalItems = totalItems;
+            this.successItems = successItems;
+            this.successRate = successRate;
+        }
+
+        private String processId;
+        private LocalDateTime createdAt;
+        private String operator;
+        private String lims;
+        private long totalItems;
+        private long successItems;
+        private int successRate;
+
+        public String getProcessId() {
+            return processId;
+        }
+
+        public void setProcessId(String processId) {
+            this.processId = processId;
+        }
+
+        public LocalDateTime getCreatedAt() {
+            return createdAt;
+        }
+
+        public void setCreatedAt(LocalDateTime createdAt) {
+            this.createdAt = createdAt;
+        }
+
+        public String getOperator() {
+            return operator;
+        }
+
+        public void setOperator(String operator) {
+            this.operator = operator;
+        }
+
+        public String getLims() {
+            return lims;
+        }
+
+        public void setLims(String lims) {
+            this.lims = lims;
+        }
+
+        public long getTotalItems() {
+            return totalItems;
+        }
+
+        public void setTotalItems(long totalItems) {
+            this.totalItems = totalItems;
+        }
+
+        public long getSuccessItems() {
+            return successItems;
+        }
+
+        public void setSuccessItems(long successItems) {
+            this.successItems = successItems;
+        }
+
+        public int getSuccessRate() {
+            return successRate;
+        }
+
+        public void setSuccessRate(int successRate) {
+            this.successRate = successRate;
+        }
+    }
+
+    private static class LimsAndOperator {
+
+        List<String> operator;
+        List<String> limsValues;
+
+        public List<String> getOperator() {
+            return operator;
+        }
+
+        public void setOperator(List<String> operator) {
+            this.operator = operator;
+        }
+
+        public List<String> getLimsValues() {
+            return limsValues;
+        }
+
+        public void setLimsValues(List<String> limsValues) {
+            this.limsValues = limsValues;
+        }
+
+    }
+
+    private LimsAndOperator analyzeLimsAndOperator(String number) {
+
+        LimsAndOperator limsAndOp = new LimsAndOperator();
+
+        List<String> opValues = new ArrayList<>();
+        List<String> limsValues = new ArrayList<>();
+
+        if (number.startsWith("28601")) {
+            opValues.add("TURKCELL");
+            if (number.length() == 15) {
+                limsValues.add("GSM-TURKCELL-ERICSSON-IMS1");
+            } else {
+                limsValues.add("GSM-TURKCELL-MAVENIR-DIGILIMS");
+            }
+        } else if (number.startsWith("28602")) {
+            opValues.add("VODAFONE");
+            if (number.length() == 15) {
+                limsValues.add("VODAFONE-NOKIA-VOIDA-CS");
+            } else {
+                limsValues.add("VODAFONE-NOKIA-VOIDA-VOLTE");
+            }
+        } else if (number.startsWith("28603")) {
+            opValues.add("TT MOBIL");
+            if (number.length() == 15) {
+                limsValues.add("GSM-AVEA-ARGELA-CS");
+                limsValues.add("GSM-AVEA-NOKIA-TIB");
+            } else {
+                limsValues.add("GSM-AVEA-ARGELA-VOLTE");
+            }
+        } else if (number.startsWith("903") || number.startsWith("902") || number.startsWith("904")) {
+            opValues.add("TT SABIT");
+            opValues.add("STH");
+            opValues.add("SUPERONLINE");
+            limsValues.add("TT-ARGELA-HUAWEI");
+            limsValues.add("TT-ARGELA-ZTE");
+            limsValues.add("SUPERONLINE-MAVENIR-DIGILIMS-VOLTE");
+            limsValues.add("STH-DIGILIMS");
+        }
+        limsAndOp.setOperator(opValues);
+        limsAndOp.setLimsValues(limsValues);
+
+        return limsAndOp;
+    }
+
+    @PostMapping("/save")
+    public ResponseEntity<?> saveToDatabase(
+            @RequestBody List<CellOperationModel> list,
+            @RequestParam String processId) {
+
+        try {
+            List<CellOperationEntity> entities = new ArrayList<>();
+            Set<String> limsAralikTipleri = Set.of("TT-ARGELA-HUAWEI", "TT-ARGELA-ZTE", "SUPERONLINE-MAVENIR-DIGILIMS-VOLTE", "STH-DIGILIMS");
+
+            for (CellOperationModel item : list) {
+                LimsAndOperator limsAndOp = analyzeLimsAndOperator(item.getHedefno());
+
+                List<String> operators = limsAndOp.getOperator().isEmpty()
+                        ? Collections.singletonList("UNKNOWN")
+                        : limsAndOp.getOperator();
+
+                List<String> limsValues = limsAndOp.getLimsValues().isEmpty()
+                        ? Collections.singletonList("UNKNOWN")
+                        : limsAndOp.getLimsValues();
+
+                // AralÄ±k gerekiyor mu kontrol et
+                boolean anyLimsNeedsRange = limsValues.stream()
+                        .anyMatch(lims -> limsAralikTipleri.contains(lims.toUpperCase()));
+
+                List<String> hedefnolar = new ArrayList<>();
+                if (anyLimsNeedsRange
+                        && (item.getHedefno().startsWith("902") || item.getHedefno().startsWith("903") || item.getHedefno().startsWith("904"))) {
+
+                    Connection conn = getConnection(list.get(0).getUsername(),
+                            list.get(0).getPassword(),
+                            "ABONESTG",
+                            list.get(0).getIpaddress());
+
+                    List<String> trimmedList = List.of(item.getHedefno().substring(2));
+
+                    ArrayList<String> hedefListesi = new ArrayList<>(trimmedList);
+
+                    List<String> hedefNoPre = sabitVizyonCreateList(hedefListesi, conn);
+
+                    Set<String> uniqueHedefler = new LinkedHashSet<>(hedefNoPre);
+
+                    hedefnolar = uniqueHedefler.stream().map(num -> "90" + num).collect(Collectors.toList());
+                } else {
+                    hedefnolar.add(item.getHedefno());
+                }
+
+                for (String operator : operators) {
+                    for (String lims : limsValues) {
+
+                        // Filtreleme mantÄ±ÄÄ±
+                        if (operator.equalsIgnoreCase("TT SABIT")
+                                && !(lims.equalsIgnoreCase("TT-ARGELA-HUAWEI") || lims.equalsIgnoreCase("TT-ARGELA-ZTE"))) {
+                            continue;
+                        }
+
+                        if (operator.equalsIgnoreCase("STH")
+                                && !lims.equalsIgnoreCase("STH-DIGILIMS")) {
+                            continue;
+                        }
+
+                        if (operator.equalsIgnoreCase("SUPERONLINE")
+                                && !lims.equalsIgnoreCase("SUPERONLINE-MAVENIR-DIGILIMS-VOLTE")) {
+                            continue;
+                        }
+
+                        for (String hedefno : hedefnolar) {
+                            entities.add(createEntity(processId, item, operator, lims, hedefno));
+                        }
+                    }
+                }
+            }
+
+            service.saveAll(entities);
+            startProcessing(processId);
+
+            return ResponseEntity.ok("Veriler baÅarÄ±yla kaydedildi ve iÅlem baÅlatÄ±ldÄ±");
+        } catch (Exception ex) {
+            return ResponseEntity.status(500).body("KayÄ±t sÄ±rasÄ±nda hata: " + ex.getMessage());
+        }
+    }
+
+    public Connection getConnection(String username, String password, String dbName, String ipAddress) {
+        Connection conn = null;
+        try {
+            if (conn == null || conn.isClosed() || !conn.isValid(2)) {
+                String url = "jdbc:oracle:thin:@" + ipAddress + ":1521:" + dbName;
+                Class.forName("oracle.jdbc.driver.OracleDriver");
+                conn = DriverManager.getConnection(url, username, password);
+            }
+        } catch (SQLException e) {
+            System.out.println("VeritabanÄ± Baglantisi Kurulamadi : " + e.getMessage());
+        } catch (ClassNotFoundException ex) {
+            System.out.println("VeritabanÄ± Driveri Bulunamadi : " + ex.getMessage());
+        }
+        return conn;
+    }
+
+    private static String removeLastChar(String s) {
+        return s.substring(0, s.length() - 1);
+    }
+
+    private static ArrayList<String> runQueryPstn(final Connection conn, final String query, final String column) throws ClassNotFoundException, SQLException {
+        ArrayList<String> list = new ArrayList<>();
+        try {
+            Statement st = conn.createStatement();
+            ResultSet rs = st.executeQuery(query);
+            while (rs.next()) {
+                String i = rs.getString(column);
+                list.add(i);
+            }
+
+        } catch (SQLException e) {
+
+        }
+        return list;
+
+    }
+
+    public <T> List<List<T>> partitionList(List<T> list, int size) {
+        List<List<T>> partitions = new ArrayList<>();
+        for (int i = 0; i < list.size(); i += size) {
+            partitions.add(list.subList(i, Math.min(i + size, list.size())));
+        }
+        return partitions;
+    }
+
+    private ArrayList<String> sabitVizyonCreateList(ArrayList<String> warrantList, Connection conn) throws SQLException, ClassNotFoundException {
+        String warList = "";
+        ArrayList<String> lastList = new ArrayList<>();
+        ArrayList<String> orgWar = new ArrayList<>();
+        ArrayList<String> pri_last = new ArrayList<>();
+        ArrayList<String> pstn = new ArrayList<>();
+        ArrayList<String> pri_2017 = new ArrayList<>();
+        List<String> strList = warrantList;
+        List<List<String>> subList = partitionList(strList, 500);
+        for (int i = 0; i < subList.size(); i++) {
+            warList = "";
+            orgWar.removeAll(orgWar);
+            pri_last.removeAll(pri_last);
+            pstn.removeAll(pstn);
+            pri_2017.removeAll(pri_2017);
+            for (String line : subList.get(i)) {
+                if (!line.startsWith("#") && !line.isEmpty()) {
+                    String lastLine = line.substring(2);
+                    orgWar.add(lastLine);
+                    warList = warList + "'" + lastLine + "',";
+                }
+            }
+            String query_table_pstn = "", query_table_pri = "";
+            String query_pstn = "", query_pri = "";
+            warList = removeLastChar(warList);
+            query_table_pstn = "SELECT * FROM all_tables WHERE owner= 'KIM' AND table_name LIKE 'TMPABONEPSTN%' ORDER BY TABLE_NAME "
+                    + "DESC FETCH FIRST 1 ROWS ONLY";
+            query_table_pri = "SELECT * FROM all_tables WHERE owner= 'KIM' AND table_name LIKE 'TMPABONEPRI%' ORDER BY TABLE_NAME "
+                    + "DESC FETCH FIRST 1 ROWS ONLY";
+            String tableName = "TABLE_NAME";
+
+            ArrayList<String> sonuc_pri = runQueryPstn(conn, query_table_pri, tableName);
+            ArrayList<String> sonuc_pstn = runQueryPstn(conn, query_table_pstn, tableName);
+
+            String str_pri = sonuc_pri.get(0);
+            String str_pstn = sonuc_pstn.get(0);
+
+            query_pri = "SELECT SEBEKE_HIZMET_NO FROM KIM." + str_pri + " where ISDN_PILOT_NO IN ( " + warList + " ) ";
+            query_pstn = "SELECT SEBEKE_HIZMET_NO FROM KIM." + str_pstn + " where Z_HIZMET_NO IN ( " + warList + " ) ";
+
+            System.out.println("str1 : " + query_pri + " str2 : " + query_pstn);
+
+            pri_last = runQueryPstn(conn, query_pri, "SEBEKE_HIZMET_NO");
+            pstn = runQueryPstn(conn, query_pstn, "SEBEKE_HIZMET_NO");
+
+            lastList.addAll(pri_last);
+            lastList.addAll(pstn);
+            lastList.addAll(orgWar);
+
+        }
+        Set<String> uniqueSet = new HashSet<>(lastList);
+        lastList = new ArrayList<>(uniqueSet);
+        return lastList;
+    }
+
+    private CellOperationEntity createEntity(String processId, CellOperationModel item,
+            String operator, String lims, String hedefno) {
+        CellOperationEntity entity = new CellOperationEntity();
+        entity.setProcessId(processId);
+        entity.setHedefno(hedefno);
+        entity.setOperator(operator);
+        entity.setLims(lims);
+        entity.setDate(item.getDate());
+        entity.setIpaddress(item.getIpaddress());
+        entity.setUsername(item.getUsername());
+        entity.setPassword(item.getPassword());
+        entity.setStatus("PENDING");
+        entity.setCreatedAt(LocalDateTime.now());
+        return entity;
+    }
+
+    private void startProcessing(String processId) {
+
+        String limsTypeAveaNokia = "GSM-AVEA-NOKIA-TIB".trim().toLowerCase(trlocale);
+
+        LimsProperties.LimsConfig configAveaNokia = limsProperties.getConfigs().get(limsTypeAveaNokia);
+
+        LimsServices limsServiceAveaNokia = limsServicesFactory.getService(limsTypeAveaNokia);
+
+        warrantEntryModelGsmAveaNokia = limsServiceAveaNokia.login(
+                configAveaNokia.getUsername(),
+                configAveaNokia.getPassword(),
+                configAveaNokia.getIpaddress()
+        );
+
+        String limsTypeAveaArgelaCs = "GSM-AVEA-ARGELA-CS".trim().toLowerCase(trlocale);
+
+        LimsProperties.LimsConfig configAveaArgelaCs = limsProperties.getConfigs().get(limsTypeAveaArgelaCs);
+
+        LimsServices limsServiceAveaArgelaCs = limsServicesFactory.getService(limsTypeAveaArgelaCs);
+
+        warrantEntryModelGsmAveaArgelaCs = limsServiceAveaArgelaCs.login(
+                configAveaArgelaCs.getUsername(),
+                configAveaArgelaCs.getPassword(),
+                configAveaArgelaCs.getIpaddress()
+        );
+        
+        String limsTypeAveaArgelaVolte = "GSM-AVEA-ARGELA-VOLTE".trim().toLowerCase(trlocale);
+
+        LimsProperties.LimsConfig configAveaArgelaVolte = limsProperties.getConfigs().get(limsTypeAveaArgelaVolte);
+
+        LimsServices limsServiceAveaArgelaVolte = limsServicesFactory.getService(limsTypeAveaArgelaVolte);
+
+        warrantEntryModelGsmAveaArgelaVolte = limsServiceAveaArgelaVolte.login(
+                configAveaArgelaVolte.getUsername(),
+                configAveaArgelaVolte.getPassword(),
+                configAveaArgelaCs.getIpaddress()
+        );
+        /*
+            } else if (item.getLims().equalsIgnoreCase("GSM-AVEA-ARGELA-CS")) {
+                return "Successfully processed with GSM-AVEA-ARGELA-CS for " + convertHedef(item.getHedefno(), item.getLims());
+            } else if (item.getLims().equalsIgnoreCase("GSM-AVEA-ARGELA-VOLTE")) {
+                return "Successfully processed with GSM-AVEA-ARGELA-VOLTE for " + convertHedef(item.getHedefno(), item.getLims());
+            } else if (item.getLims().equalsIgnoreCase("TT-ARGELA-HUAWEI")) {
+                return "Successfully processed with TT-ARGELA-HUAWEI for " + convertHedef(item.getHedefno(), item.getLims());
+            } else if (item.getLims().equalsIgnoreCase("TT-ARGELA-ZTE")) {
+                return "Successfully processed with TT-ARGELA-ZTE for " + convertHedef(item.getHedefno(), item.getLims());
+            } else if (item.getLims().equalsIgnoreCase("GSM-TURKCELL-ERICSSON-IMS1")) {
+                return "Successfully processed with GSM-TURKCELL-ERICSSON-IMS1 for " + convertHedef(item.getHedefno(), item.getLims());
+            } else if (item.getLims().equalsIgnoreCase("GSM-TURKCELL-MAVENIR-DIGILIMS")) {
+                return "Successfully processed with GSM-TURKCELL-MAVENIR-DIGILIMS for " + convertHedef(item.getHedefno(), item.getLims());
+            } else if (item.getLims().equalsIgnoreCase("SUPERONLINE-MAVENIR-DIGILIMS-VOLTE")) {
+                return "Successfully processed with SUPERONLINE-MAVENIR-DIGILIMS-VOLTE for " + convertHedef(item.getHedefno(), item.getLims());
+            } else if (item.getLims().equalsIgnoreCase("VODAFONE-NOKIA-VOIDA-CS")) {
+                return "Successfully processed with VODAFONE-NOKIA-VOIDA-CS for " + convertHedef(item.getHedefno(), item.getLims());
+            } else if (item.getLims().equalsIgnoreCase("VODAFONE-NOKIA-VOIDA-VOLTE")) {
+                return "Successfully processed with VODAFONE-NOKIA-VOIDA-VOLTE for " + convertHedef(item.getHedefno(), item.getLims());
+            } else if (item.getLims().equalsIgnoreCase("STH-DIGILIMS")) {
+                return "Successfully processed with STH-DIGILIMS for " + convertHedef(item.getHedefno(), item.getLims());
+            }
+         */
+        executorService.submit(() -> {
+            try {
+                logger.info("Process {} started", processId);
+
+                // Ãnce tÃ¼m PENDING olanlarÄ± PROCESSING yap
+                service.updateStatusByProcessId(processId, "PENDING", "PROCESSING", "Processing started");
+
+                List<CellOperationEntity> itemsToProcess = service.findByProcessIdAndStatus(processId, "PROCESSING");
+                int totalItems = itemsToProcess.size();
+                AtomicInteger processedCount = new AtomicInteger(0);
+
+                itemsToProcess.parallelStream().forEach(item -> {
+                    try {
+                        String result = processItem(item);
+                        service.updateStatusAndResult(item.getId(), "COMPLETED", result);
+                        processedCount.incrementAndGet();
+
+                        // Her 10 iÅlemde bir log kaydÄ±
+                        if (processedCount.get() % 10 == 0) {
+                            logger.info("Process {}: {}/{} items processed ({}%)",
+                                    processId,
+                                    processedCount.get(),
+                                    totalItems,
+                                    (processedCount.get() * 100 / totalItems));
+                        }
+                    } catch (Exception ex) {
+                        logger.error("Error processing item {}: {}", item.getId(), ex.getMessage());
+                        service.updateStatusAndResult(item.getId(), "FAILED", "Error: " + ex.getMessage());
+                    }
+                });
+
+                logger.info("Process {} completed. Total: {}, Success: {}, Failed: {}",
+                        processId,
+                        totalItems,
+                        service.countByProcessIdAndStatus(processId, "COMPLETED"),
+                        service.countByProcessIdAndStatus(processId, "FAILED"));
+
+            } catch (Exception ex) {
+                logger.error("Error in process {}: {}", processId, ex.getMessage(), ex);
+                service.updateAllStatusByProcessId(processId, "FAILED", "System error: " + ex.getMessage());
+            }
+        });
+    }
+
+    @Scheduled(fixedDelay = 300000)
+    public void checkStuckProcesses() {
+        try {
+            LocalDateTime threshold = LocalDateTime.now().minusMinutes(10);
+            List<CellOperationEntity> stuckItems = service.findByStatusAndProcessedAtBefore("PROCESSING", threshold);
+
+            if (!stuckItems.isEmpty()) {
+                logger.warn("Found {} stuck items", stuckItems.size());
+
+                Map<String, List<Long>> groupedIds = stuckItems.stream()
+                        .collect(Collectors.groupingBy(
+                                CellOperationEntity::getProcessId,
+                                Collectors.mapping(CellOperationEntity::getId, Collectors.toList())
+                        ));
+
+                groupedIds.forEach((processId, ids) -> {
+                    service.updateStatusByIds(ids, "FAILED", "Process timeout (took more than 10 minutes)");
+                    logger.info("Marked {} items as FAILED for process {}", ids.size(), processId);
+                });
+            }
+        } catch (Exception ex) {
+            logger.error("Error while checking stuck processes", ex);
+        }
+    }
+
+    private static int nokiaToAltaysWarrantStatus(String state) {
+        if (state.trim().equalsIgnoreCase("TERMINATED")) {
+            return AltayWarrantStatusType.TERMINATED.getValue();
+        }
+        if (state.trim().equalsIgnoreCase("ENABLED")) {
+            return AltayWarrantStatusType.ACTIVATED.getValue();
+        }
+        if (state.trim().equalsIgnoreCase("PENDING")) {
+            return AltayWarrantStatusType.IN_PROGRESS.getValue();
+        }
+        if (state.trim().equalsIgnoreCase("PARTIAL")) {
+            return AltayWarrantStatusType.ACTIVATED.getValue();
+        }
+        if (state.trim().equalsIgnoreCase("UNKNOWN")) {
+            return AltayWarrantStatusType.ACTIVATED.getValue();
+        }
+        if (state.trim().equalsIgnoreCase("INACTIVE")) {
+            return AltayWarrantStatusType.ACTIVATED.getValue();
+        }
+        return AltayWarrantStatusType.UNKNOWN.getValue();
+    }
+
+    private String processItem(CellOperationEntity item) {
+        try {
+
+            String liid = "", warRef = "";
+
+            List<WarrantReturnModel> warrantList = new ArrayList<>();
+
+            WarrantOperationModel limsSearch = new WarrantOperationModel();
+
+            limsSearch.setHedef(convertHedef(item.getHedefno(), item.getLims()));
+            limsSearch.setDate(item.getDate());
+
+            String limsType = item.getLims().trim().toLowerCase(trlocale);
+
+            //LimsProperties.LimsConfig config = limsProperties.getConfigs().get(limsType);
+            LimsServices limsService = limsServicesFactory.getService(limsType);
+
+            if (item.getLims().equalsIgnoreCase("GSM-AVEA-NOKIA-TIB")) {
+                int stateActive = 0;
+                limsSearch.setLea("TIB3L");
+                limsSearch.setWarranttype("LOCATION");
+                List<String> state = Arrays.asList("ALL");
+                limsSearch.setState(state);
+                limsSearch.setInterceptType("VOICE");
+                if (limsService != null) {
+
+                    warrantList = limsService.search(limsSearch, warrantEntryModelGsmAveaNokia, limsType);
+
+                    if (!warrantList.isEmpty()) {
+                        for (int i = 0; i < warrantList.size(); i++) {
+                            int existingState = nokiaToAltaysWarrantStatus(warrantList.get(i).getState());
+                            if (existingState == AltayWarrantStatusType.ACTIVATED.getValue()
+                                    || existingState == AltayWarrantStatusType.IN_PROGRESS.getValue()) {
+                                stateActive++;
+                                liid = warrantList.get(i).getLiid();
+                                warRef = warrantList.get(i).getWarrantid();
+                                limsSearch.setWarrantid(warRef);
+
+                                int daysToAdd = 1;
+                                
+                                DateTimeFormatter formatter = DateTimeFormatter.ofPattern("dd-MM-yyyy");
+                                LocalDate localDate = LocalDate.parse(warrantList.get(i).getDate(),formatter);
+                                
+                                LocalDate newDate = localDate.plusDays(daysToAdd);
+                                
+                                Date date = Date.from(newDate.atStartOfDay(ZoneId.systemDefault()).toInstant());
+                                
+                                System.out.println("limsSearch " + limsSearch.getDate() + " limsRetur : " + date);
+                                
+                                if (limsSearch.getDate().after(date)) {
+                                    limsService.modify(limsSearch, warrantEntryModelGsmAveaNokia, limsType);
+                                }
+                            }
+                        }
+                        if (stateActive == 0) {
+                            limsService.create(limsSearch, warrantEntryModelGsmAveaNokia, limsType);
+                            return "WARRANT " + convertHedef(item.getHedefno(), item.getLims()) + " SUCCESFULLY CREATED";
+                        } else {
+                            return "WARRANT " + convertHedef(item.getHedefno(), item.getLims()) + " SUCCESFULLY MODIFIED";
+                        }
+                    } else {
+                        limsService.create(limsSearch, warrantEntryModelGsmAveaNokia, limsType);
+                        return "WARRANT " + convertHedef(item.getHedefno(), item.getLims()) + " SUCCESFULLY CREATED";
+                    }
+
+                } else {
+                    return "Gecersiz Lims Tipi : " + limsType + " for " + convertHedef(item.getHedefno(), item.getLims());
+                }
+            } else if (item.getLims().equalsIgnoreCase("GSM-AVEA-ARGELA-CS")) {
+                limsSearch.setLea("102");
+                limsSearch.setWarranttype("LOCATION_NUMBER");
+                List<String> state = Arrays.asList("STARTED");
+                limsSearch.setState(state);
+                if (limsService != null) {
+                    warrantList = limsService.search(limsSearch, warrantEntryModelGsmAveaArgelaCs, limsType);
+                    if (!warrantList.isEmpty()) {
+
+                        liid = warrantList.get(0).getLiid();
+                        warRef = warrantList.get(0).getWarrantid();
+                        limsSearch.setWarrantid(warRef);
+                        limsSearch.setLiid(liid);
+                        limsService.modify(limsSearch, warrantEntryModelGsmAveaArgelaCs, limsType);
+
+                        return "WARRANT " + convertHedef(item.getHedefno(), item.getLims()) + " SUCCESFULLY MODIFIED";
+                    } else {
+                        limsService.create(limsSearch, warrantEntryModelGsmAveaArgelaCs, limsType);
+                        return "WARRANT " + convertHedef(item.getHedefno(), item.getLims()) + " SUCCESFULLY CREATED";
+                    }
+
+                } else {
+                    return "Gecersiz Lims Tipi : " + limsType + " for " + convertHedef(item.getHedefno(), item.getLims());
+                }
+            } else if (item.getLims().equalsIgnoreCase("GSM-AVEA-ARGELA-VOLTE")) {
+                
+                return ttVolteService.getCountByLeaId(LimsType.VOLTE, Byte.valueOf("6")) + " Hedef " + convertHedef(item.getHedefno(), item.getLims());
+            } else if (item.getLims().equalsIgnoreCase("TT-ARGELA-HUAWEI")) {
+                return "Successfully processed with TT-ARGELA-HUAWEI for " + convertHedef(item.getHedefno(), item.getLims());
+            } else if (item.getLims().equalsIgnoreCase("TT-ARGELA-ZTE")) {
+                return "Successfully processed with TT-ARGELA-ZTE for " + convertHedef(item.getHedefno(), item.getLims());
+            } else if (item.getLims().equalsIgnoreCase("GSM-TURKCELL-ERICSSON-IMS1")) {
+                return "Successfully processed with GSM-TURKCELL-ERICSSON-IMS1 for " + convertHedef(item.getHedefno(), item.getLims());
+            } else if (item.getLims().equalsIgnoreCase("GSM-TURKCELL-MAVENIR-DIGILIMS")) {
+                return "Successfully processed with GSM-TURKCELL-MAVENIR-DIGILIMS for " + convertHedef(item.getHedefno(), item.getLims());
+            } else if (item.getLims().equalsIgnoreCase("SUPERONLINE-MAVENIR-DIGILIMS-VOLTE")) {
+                return "Successfully processed with SUPERONLINE-MAVENIR-DIGILIMS-VOLTE for " + convertHedef(item.getHedefno(), item.getLims());
+            } else if (item.getLims().equalsIgnoreCase("VODAFONE-NOKIA-VOIDA-CS")) {
+                return "Successfully processed with VODAFONE-NOKIA-VOIDA-CS for " + convertHedef(item.getHedefno(), item.getLims());
+            } else if (item.getLims().equalsIgnoreCase("VODAFONE-NOKIA-VOIDA-VOLTE")) {
+                return "Successfully processed with VODAFONE-NOKIA-VOIDA-VOLTE for " + convertHedef(item.getHedefno(), item.getLims());
+            } else if (item.getLims().equalsIgnoreCase("STH-DIGILIMS")) {
+                return "Successfully processed with STH-DIGILIMS for " + convertHedef(item.getHedefno(), item.getLims());
+            }
+
+            return "Completed - " + item.getHedefno();
+        } catch (Exception ex) {
+            System.out.println(ex.getMessage());
+            throw new RuntimeException("Processing error" + ex.getMessage(), ex);
+        }
+    }
+
+    private String convertHedef(String hedefNo, String imsName) {
+        String convertedHedef = "";
+
+        if (imsName.equalsIgnoreCase("GSM-AVEA-NOKIA-TIB")) {
+            String[] splitted = hedefNo.split("(?<=\\G.{5})");
+            if (splitted[0].equals("28603")) {
+                String lac = String.format("%4s", Utils.toHexUpper(Integer.parseInt(splitted[1])));
+                String cell = String.format("%4s", Utils.toHexUpper(Integer.parseInt(splitted[2])));
+                lac = lac.replace(' ', '0');
+                cell = cell.replace(' ', '0');
+                convertedHedef = lac + cell + "H";
+            }
+        } else if (imsName.equalsIgnoreCase("GSM-AVEA-ARGELA-CS")) {
+            String[] splitted = hedefNo.split("(?<=\\G.{5})");
+            if (splitted[0].equals("28603")) {
+                String lac = splitted[1];
+                String cell = splitted[2];
+                convertedHedef = "286-03-" + lac + "-" + cell;
+            }
+        } else if (imsName.equalsIgnoreCase("GSM-AVEA-ARGELA-VOLTE")) {
+            String opCode = hedefNo.substring(0, 5);
+            if (opCode.equals("28603")) {
+                String lac = hedefNo.substring(5, 5);
+                String eci = hedefNo.substring(hedefNo.length() - 10);
+                String eNodeBId = eci.substring(0, 8);
+                String cellId = eci.substring(eci.length() - 2);
+                String eNodeBIdHex = String.format("%5s", Utils.toHexUpper(Integer.parseInt(eNodeBId)));
+                String cellIdHex = String.format("%2s", Utils.toHexUpper(Integer.parseInt(cellId)));
+                String eNodeBIdLast = eNodeBIdHex.replace(' ', '0');
+                String cellIdLast = cellIdHex.replace(' ', '0');
+                convertedHedef = "28603" + eNodeBIdLast + cellIdLast;
+            }
+        } else if (imsName.equalsIgnoreCase("TT-ARGELA-HUAWEI")) {
+            convertedHedef = hedefNo;
+        } else if (imsName.equalsIgnoreCase("TT-ARGELA-ZTE")) {
+            convertedHedef = hedefNo;
+        } else if (imsName.equalsIgnoreCase("GSM-TURKCELL-ERICSSON-IMS1")) {
+            String[] splitted = hedefNo.split("(?<=\\G.{" + 5 + "})");
+            if (splitted[0].equals("28601")) {
+                String lac = splitted[1];
+                String cell = splitted[2];
+                String caseId = lac + cell;
+                convertedHedef = "286-01-" + lac.replaceFirst("^0+(?!$)", "") + "-" + cell.replaceFirst("^0+(?!$)", "");
+            }
+        } else if (imsName.equalsIgnoreCase("GSM-TURKCELL-MAVENIR-DIGILIMS")) {
+            String opCode = hedefNo.substring(0, 5);
+            if (opCode.equals("28601")) {
+                String eci = hedefNo.substring(hedefNo.length() - 10);
+                String eNodeBId = eci.substring(0, 7);
+                String cellId = eci.substring(7);
+                String eNodeBIdHex = String.format("%5s", Utils.toHexUpper(Integer.parseInt(eNodeBId)));
+                String cellIdHex = String.format("%2s", Utils.toHexUpper(Integer.parseInt(cellId)));
+                String eNodeBIdLast = eNodeBIdHex.replace(' ', '0');
+                String cellIdLast = cellIdHex.replace(' ', '0');
+                convertedHedef = eNodeBIdLast + cellIdLast;
+            }
+        } else if (imsName.equalsIgnoreCase("SUPERONLINE-MAVENIR-DIGILIMS-VOLTE")) {
+            convertedHedef = hedefNo;
+        } else if (imsName.equalsIgnoreCase("VODAFONE-NOKIA-VOIDA-CS")) {
+            String[] splitted = hedefNo.split("(?<=\\G.{" + 5 + "})");
+            if (splitted[0].equals("28602")) {
+                String lac = String.format("%4s", Utils.toHexUpper(Integer.parseInt(splitted[1])));
+                String cell = String.format("%4s", Utils.toHexUpper(Integer.parseInt(splitted[2])));
+                lac = lac.replace(' ', '0');
+                cell = cell.replace(' ', '0');
+                convertedHedef = "28602" + lac + cell;
+            }
+        } else if (imsName.equalsIgnoreCase("VODAFONE-NOKIA-VOIDA-VOLTE")) {
+            String opCode = hedefNo.substring(0, 5);
+            if (opCode.equals("28602")) {
+                String lac = hedefNo.substring(5, 10);
+                String eci = hedefNo.substring(hedefNo.length() - 7);
+                String eNodeBId = eci.substring(0, 5);
+                String cellId = eci.substring(5);
+                String lacHex = String.format("%4s", Utils.toHexLower(Integer.parseInt(lac)));
+                String eNodeBIdHex = String.format("%5s", Utils.toHexLower(Integer.parseInt(eNodeBId)));
+                String cellIdHex = String.format("%2s", Utils.toHexLower(Integer.parseInt(cellId)));
+                String eNodeBIdLast = eNodeBIdHex.replace(' ', '0');
+                String cellIdLast = cellIdHex.replace(' ', '0');
+                convertedHedef = "28602" + lacHex + eNodeBIdLast + cellIdLast;
+            }
+        } else if (imsName.equalsIgnoreCase("STH-DIGILIMS")) {
+            convertedHedef = hedefNo;
+        }
+
+        return convertedHedef;
+    }
+
+}
